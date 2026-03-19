@@ -8,7 +8,7 @@ import {
 import { listFiles, randomItem, fileExists, ensureDir } from "../utils/fs";
 import type { Config } from "../config";
 import type { ClipCandidate } from "../pipeline/types";
-import { join, dirname } from "path";
+import { dirname, extname, join } from "path";
 
 const log = createLogger("video-processor");
 
@@ -19,7 +19,8 @@ export interface SpeechRange {
 
 export class VideoProcessor {
   async extractClip(videoPath: string, clip: ClipCandidate, outputDir: string): Promise<string> {
-    const outputPath = join(outputDir, `${clip.id}_raw.mp4`);
+    const outputExtension = this.getClipExtension(videoPath);
+    const outputPath = join(outputDir, `${clip.id}_raw${outputExtension}`);
 
     if (await fileExists(outputPath)) {
       log.info(`Clip already extracted: ${clip.title}`);
@@ -34,20 +35,24 @@ export class VideoProcessor {
       secondsToFfmpegTimestamp(clip.startTime),
       "-to",
       secondsToFfmpegTimestamp(clip.endTime),
-      "-c:v",
-      "libx264",
-      "-preset",
-      "fast",
-      "-crf",
-      "18",
-      "-c:a",
-      "aac",
-      "-b:a",
-      "192k",
+      ...this.getEncodingArgs(outputExtension),
       "-y",
       outputPath,
     ]);
 
+    return outputPath;
+  }
+
+  async exportClip(clipPath: string, outputPath: string): Promise<string> {
+    ensureDir(dirname(outputPath));
+
+    if (await fileExists(outputPath)) {
+      log.info("Exported clip already exists");
+      return outputPath;
+    }
+
+    await Bun.write(outputPath, Bun.file(clipPath));
+    log.info(`Clip exported: ${outputPath}`);
     return outputPath;
   }
 
@@ -180,7 +185,8 @@ export class VideoProcessor {
 
     if (hasCaptions) {
       filterComplex +=
-        `;[2:v]fps=30,scale=${w}:${h},colorkey=0x00FF00:0.3:0.1[captions];` + `[bg][captions]overlay=0:0:format=auto[out]`;
+        `;[2:v]fps=30,scale=${w}:${h},colorkey=0x00FF00:0.3:0.1[captions];` +
+        `[bg][captions]overlay=0:0:format=auto[out]`;
     } else {
       filterComplex += `;[bg]copy[out]`;
     }
@@ -244,7 +250,8 @@ export class VideoProcessor {
 
     if (hasCaptions) {
       filterComplex +=
-        `;[1:v]fps=30,scale=${w}:${h},colorkey=0x00FF00:0.3:0.1[captions];` + `[base][captions]overlay=0:0:format=auto[out]`;
+        `;[1:v]fps=30,scale=${w}:${h},colorkey=0x00FF00:0.3:0.1[captions];` +
+        `[base][captions]overlay=0:0:format=auto[out]`;
     } else {
       filterComplex += `;[base]copy[out]`;
     }
@@ -304,5 +311,33 @@ export class VideoProcessor {
     }
 
     return speech;
+  }
+
+  private getClipExtension(videoPath: string): string {
+    const inputExtension = extname(videoPath).toLowerCase();
+    return inputExtension === ".webm" ? ".webm" : ".mp4";
+  }
+
+  private getEncodingArgs(outputExtension: string): string[] {
+    if (outputExtension === ".webm") {
+      return [
+        "-c:v",
+        "libvpx-vp9",
+        "-crf",
+        "33",
+        "-b:v",
+        "0",
+        "-deadline",
+        "good",
+        "-cpu-used",
+        "4",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "128k",
+      ];
+    }
+
+    return ["-c:v", "libx264", "-preset", "fast", "-crf", "18", "-c:a", "aac", "-b:a", "192k"];
   }
 }

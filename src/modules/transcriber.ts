@@ -6,6 +6,10 @@ import { join } from "path";
 
 const log = createLogger("transcriber");
 
+function pythonExecutable(): string {
+  return process.platform === "win32" ? "python" : "python3";
+}
+
 export class Transcriber {
   async transcribe(
     metadata: VideoMetadata,
@@ -33,7 +37,7 @@ fetched = ytt_api.fetch("${metadata.videoId}")
 snippets = [{"text": s.text, "start": s.start, "duration": s.duration} for s in fetched.snippets]
 print(json.dumps(snippets))
 `;
-    const proc = Bun.spawn(["python3", "-c", script], { stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn([pythonExecutable(), "-c", script], { stdout: "pipe", stderr: "pipe" });
     const stdout = await new Response(proc.stdout).text();
     const stderr = await new Response(proc.stderr).text();
     const exitCode = await proc.exited;
@@ -69,7 +73,7 @@ result = model.transcribe("${metadata.filePath}", language="en")
 segments = [{"text": s["text"].strip(), "start": s["start"], "end": s["end"], "duration": s["end"] - s["start"]} for s in result["segments"]]
 print(json.dumps(segments))
 `;
-    const proc = Bun.spawn(["python3", "-c", script], { stdout: "pipe", stderr: "pipe" });
+    const proc = Bun.spawn([pythonExecutable(), "-c", script], { stdout: "pipe", stderr: "pipe" });
     const stdout = await new Response(proc.stdout).text();
     const stderr = await new Response(proc.stderr).text();
     const exitCode = await proc.exited;

@@ -1,10 +1,19 @@
+import { dirname } from "path";
 import { Database } from "bun:sqlite";
-import { PipelineStage, StageStatus, type PipelineRun, type StageResult } from "./types";
+import { ensureDir } from "@/utils/fs";
+import {
+  CLIP_COMPLETION_MARKER,
+  PipelineStage,
+  StageStatus,
+  type PipelineRun,
+  type StageResult,
+} from "./types";
 
 export class CheckpointManager {
   private db: Database;
 
   constructor(dbPath: string) {
+    ensureDir(dirname(dbPath));
     this.db = new Database(dbPath, { create: true });
     this.db.exec("PRAGMA journal_mode = WAL");
     this.migrate();
@@ -193,16 +202,26 @@ export class CheckpointManager {
 
   getIncompleteClipIds(runId: string): string[] {
     const rows = this.db
-      .prepare("SELECT id FROM clip_progress WHERE run_id = ? AND status != 'completed'")
+      .prepare("SELECT id, status, artifact_paths FROM clip_progress WHERE run_id = ?")
       .all(runId) as any[];
-    return rows.map((r) => r.id);
+    return rows
+      .filter((row) => {
+        const artifactPaths = JSON.parse(row.artifact_paths) as Record<string, string>;
+        return row.status !== "completed" || artifactPaths[CLIP_COMPLETION_MARKER] !== "true";
+      })
+      .map((row) => row.id);
   }
 
   getCompletedClipIds(runId: string): string[] {
     const rows = this.db
-      .prepare("SELECT id FROM clip_progress WHERE run_id = ? AND status = 'completed'")
+      .prepare("SELECT id, status, artifact_paths FROM clip_progress WHERE run_id = ?")
       .all(runId) as any[];
-    return rows.map((r) => r.id);
+    return rows
+      .filter((row) => {
+        const artifactPaths = JSON.parse(row.artifact_paths) as Record<string, string>;
+        return row.status === "completed" && artifactPaths[CLIP_COMPLETION_MARKER] === "true";
+      })
+      .map((row) => row.id);
   }
 
   markRunComplete(runId: string): void {

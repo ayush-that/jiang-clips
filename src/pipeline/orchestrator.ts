@@ -1,7 +1,7 @@
 import { createLogger } from "../utils/logger";
 import { runDir, ensureDir } from "../utils/fs";
 import { CheckpointManager } from "./checkpoint";
-import { PipelineStage, StageStatus } from "./types";
+import { CLIP_COMPLETION_MARKER, PipelineStage, StageStatus } from "./types";
 import type { Config } from "../config";
 import type { VideoMetadata, Transcript, ClipCandidate, ClipArtifacts } from "./types";
 import { Downloader } from "../modules/downloader";
@@ -9,7 +9,7 @@ import { Transcriber } from "../modules/transcriber";
 import { ClipIdentifier } from "../modules/clip-identifier";
 import { VideoProcessor } from "../modules/video-processor";
 import { CaptionGenerator } from "../modules/caption-generator";
-import { join } from "path";
+import { basename, dirname, extname, join } from "path";
 
 const log = createLogger("orchestrator");
 
@@ -42,7 +42,8 @@ class Semaphore {
 export class PipelineOrchestrator {
   private checkpoint: CheckpointManager;
   private config: Config;
-  private downloader = new Downloader();
+  private downloader: Downloader;
+
   private transcriber = new Transcriber();
   private clipIdentifier: ClipIdentifier;
   private videoProcessor = new VideoProcessor();
@@ -51,6 +52,7 @@ export class PipelineOrchestrator {
   constructor(config: Config, checkpoint: CheckpointManager) {
     this.config = config;
     this.checkpoint = checkpoint;
+    this.downloader = new Downloader(config);
     this.clipIdentifier = new ClipIdentifier(config);
   }
 
@@ -193,7 +195,9 @@ export class PipelineOrchestrator {
     const outputDir = join(this.config.paths.output, metadata.videoId);
     ensureDir(outputDir);
 
-    await this.captionGenerator.warmup();
+    if (this.shouldRenderCaptionOverlay()) {
+      await this.captionGenerator.warmup();
+    }
 
     log.info(`Processing ${clips.length} clips (parallel: ${this.config.maxParallelClips})`);
 
@@ -230,20 +234,29 @@ export class PipelineOrchestrator {
     dir: string,
     outputDir: string,
   ): Promise<ClipArtifacts> {
-    const artifacts: Partial<ClipArtifacts> = { clipId: clip.id };
     const progress = this.checkpoint.getClipProgress(runId, clip.id);
 
-    // Extract
-    if (progress?.artifactPaths?.extractedVideoPath) {
-      artifacts.extractedVideoPath = progress.artifactPaths.extractedVideoPath;
-    } else {
+    const artifacts: Partial<ClipArtifacts> = {
+      clipId: clip.id,
+      extractedVideoPath: progress?.artifactPaths.extractedVideoPath,
+      silenceRemovedPath: progress?.artifactPaths.silenceRemovedPath,
+      captionOverlayPath: progress?.artifactPaths.captionOverlayPath,
+      captionSrtPath: progress?.artifactPaths.captionSrtPath ?? progress?.artifactPaths.srtPath,
+      exportedVideoPath:
+        progress?.artifactPaths.exportedVideoPath ??
+        (this.shouldComposeReel() ? progress?.artifactPaths.finalReelPath : undefined),
+      finalReelPath: progress?.artifactPaths.finalReelPath,
+    };
+    let finalStage = PipelineStage.EXTRACT_CLIPS;
+
+    if (!artifacts.extractedVideoPath) {
       this.checkpoint.updateClipProgress(
         runId,
         clip.id,
         clipIndex,
         PipelineStage.EXTRACT_CLIPS,
         "in_progress",
-        {},
+        this.toArtifactPaths(artifacts),
       );
       artifacts.extractedVideoPath = await this.videoProcessor.extractClip(
         metadata.filePath,
@@ -256,122 +269,188 @@ export class PipelineOrchestrator {
         clipIndex,
         PipelineStage.EXTRACT_CLIPS,
         "completed",
-        {
-          extractedVideoPath: artifacts.extractedVideoPath,
-        },
+        this.toArtifactPaths(artifacts),
       );
     }
 
-    // Remove silence
-    if (progress?.artifactPaths?.silenceRemovedPath) {
-      artifacts.silenceRemovedPath = progress.artifactPaths.silenceRemovedPath;
-    } else {
-      this.checkpoint.updateClipProgress(
-        runId,
-        clip.id,
-        clipIndex,
-        PipelineStage.REMOVE_SILENCE,
-        "in_progress",
-        {
-          extractedVideoPath: artifacts.extractedVideoPath,
-        },
-      );
-      const desilencedPath = join(dir, "desilenced", `${clip.id}_clean.mp4`);
-      const result = await this.videoProcessor.removeSilence(
+    if (this.shouldComposeReel()) {
+      if (!artifacts.silenceRemovedPath) {
+        this.checkpoint.updateClipProgress(
+          runId,
+          clip.id,
+          clipIndex,
+          PipelineStage.REMOVE_SILENCE,
+          "in_progress",
+          this.toArtifactPaths(artifacts),
+        );
+        const desilencedPath = join(dir, "desilenced", `${clip.id}_clean.mp4`);
+        const result = await this.videoProcessor.removeSilence(
+          artifacts.extractedVideoPath,
+          desilencedPath,
+          this.config,
+        );
+        artifacts.silenceRemovedPath = result.path;
+        this.checkpoint.updateClipProgress(
+          runId,
+          clip.id,
+          clipIndex,
+          PipelineStage.REMOVE_SILENCE,
+          "completed",
+          this.toArtifactPaths(artifacts),
+        );
+      }
+      finalStage = PipelineStage.REMOVE_SILENCE;
+
+      if (this.shouldRenderCaptionOverlay() && !artifacts.captionOverlayPath) {
+        this.checkpoint.updateClipProgress(
+          runId,
+          clip.id,
+          clipIndex,
+          PipelineStage.GENERATE_CAPTIONS,
+          "in_progress",
+          this.toArtifactPaths(artifacts),
+        );
+        const overlayPath = join(dir, "captions", `${clip.id}_captions.webm`);
+        artifacts.captionOverlayPath = await this.captionGenerator.generate(
+          artifacts.silenceRemovedPath,
+          overlayPath,
+          this.config,
+        );
+        this.checkpoint.updateClipProgress(
+          runId,
+          clip.id,
+          clipIndex,
+          PipelineStage.GENERATE_CAPTIONS,
+          "completed",
+          this.toArtifactPaths(artifacts),
+        );
+      }
+
+      if (!artifacts.exportedVideoPath) {
+        this.checkpoint.updateClipProgress(
+          runId,
+          clip.id,
+          clipIndex,
+          PipelineStage.COMPOSE_REEL,
+          "in_progress",
+          this.toArtifactPaths(artifacts),
+        );
+        artifacts.finalReelPath = join(outputDir, `${clip.id}_reel.mp4`);
+        artifacts.exportedVideoPath = await this.videoProcessor.composeReel(
+          artifacts.silenceRemovedPath,
+          this.config,
+          artifacts.finalReelPath,
+          this.shouldRenderCaptionOverlay() ? artifacts.captionOverlayPath : undefined,
+        );
+        this.checkpoint.updateClipProgress(
+          runId,
+          clip.id,
+          clipIndex,
+          PipelineStage.COMPOSE_REEL,
+          "completed",
+          this.toArtifactPaths(artifacts),
+        );
+      }
+      finalStage = PipelineStage.COMPOSE_REEL;
+    } else if (!artifacts.exportedVideoPath) {
+      artifacts.exportedVideoPath = await this.videoProcessor.exportClip(
         artifacts.extractedVideoPath,
-        desilencedPath,
-        this.config,
+        this.getSourceClipOutputPath(outputDir, clip.id, artifacts.extractedVideoPath),
       );
-      artifacts.silenceRemovedPath = result.path;
       this.checkpoint.updateClipProgress(
         runId,
         clip.id,
         clipIndex,
-        PipelineStage.REMOVE_SILENCE,
+        PipelineStage.EXTRACT_CLIPS,
         "completed",
-        {
-          extractedVideoPath: artifacts.extractedVideoPath,
-          silenceRemovedPath: artifacts.silenceRemovedPath,
-        },
+        this.toArtifactPaths(artifacts),
       );
     }
 
-    // Generate captions
-    if (progress?.artifactPaths?.captionOverlayPath) {
-      artifacts.captionOverlayPath = progress.artifactPaths.captionOverlayPath;
-    } else {
-      this.checkpoint.updateClipProgress(
-        runId,
-        clip.id,
-        clipIndex,
-        PipelineStage.GENERATE_CAPTIONS,
-        "in_progress",
-        {
-          extractedVideoPath: artifacts.extractedVideoPath,
-          silenceRemovedPath: artifacts.silenceRemovedPath,
-        },
-      );
+    if (this.shouldWriteCaptionSidecar()) {
+      if (!artifacts.exportedVideoPath) {
+        throw new Error(`Clip export missing for caption generation: ${clip.id}`);
+      }
 
-      const overlayPath = join(dir, "captions", `${clip.id}_captions.webm`);
-      artifacts.captionOverlayPath = await this.captionGenerator.generate(
-        artifacts.silenceRemovedPath,
-        overlayPath,
-        this.config,
-      );
-
-      this.checkpoint.updateClipProgress(
-        runId,
-        clip.id,
-        clipIndex,
-        PipelineStage.GENERATE_CAPTIONS,
-        "completed",
-        {
-          extractedVideoPath: artifacts.extractedVideoPath,
-          silenceRemovedPath: artifacts.silenceRemovedPath,
-          captionOverlayPath: artifacts.captionOverlayPath,
-        },
-      );
+      if (!artifacts.captionSrtPath) {
+        this.checkpoint.updateClipProgress(
+          runId,
+          clip.id,
+          clipIndex,
+          PipelineStage.GENERATE_CAPTIONS,
+          "in_progress",
+          this.toArtifactPaths(artifacts),
+        );
+        artifacts.captionSrtPath = await this.captionGenerator.generateSrt(
+          artifacts.exportedVideoPath,
+          this.getCaptionSidecarPath(artifacts.exportedVideoPath),
+          this.config,
+        );
+        this.checkpoint.updateClipProgress(
+          runId,
+          clip.id,
+          clipIndex,
+          PipelineStage.GENERATE_CAPTIONS,
+          "completed",
+          this.toArtifactPaths(artifacts),
+        );
+      }
+      finalStage = PipelineStage.GENERATE_CAPTIONS;
     }
 
-    // Compose reel
-    if (progress?.artifactPaths?.finalReelPath) {
-      artifacts.finalReelPath = progress.artifactPaths.finalReelPath;
-    } else {
-      this.checkpoint.updateClipProgress(
-        runId,
-        clip.id,
-        clipIndex,
-        PipelineStage.COMPOSE_REEL,
-        "in_progress",
-        {
-          extractedVideoPath: artifacts.extractedVideoPath,
-          silenceRemovedPath: artifacts.silenceRemovedPath,
-          captionOverlayPath: artifacts.captionOverlayPath,
-        },
-      );
-      const reelPath = join(outputDir, `${clip.id}_reel.mp4`);
-      artifacts.finalReelPath = await this.videoProcessor.composeReel(
-        artifacts.silenceRemovedPath,
-        this.config,
-        reelPath,
-        artifacts.captionOverlayPath,
-      );
-      this.checkpoint.updateClipProgress(
-        runId,
-        clip.id,
-        clipIndex,
-        PipelineStage.COMPOSE_REEL,
-        "completed",
-        {
-          extractedVideoPath: artifacts.extractedVideoPath,
-          silenceRemovedPath: artifacts.silenceRemovedPath,
-          captionOverlayPath: artifacts.captionOverlayPath,
-          finalReelPath: artifacts.finalReelPath,
-        },
-      );
-    }
+    this.checkpoint.updateClipProgress(
+      runId,
+      clip.id,
+      clipIndex,
+      finalStage,
+      "completed",
+      this.toArtifactPaths(artifacts, true),
+    );
 
     return artifacts as ClipArtifacts;
+  }
+
+  private shouldComposeReel(): boolean {
+    return this.config.clipRenderMode === "reel";
+  }
+
+  private shouldRenderCaptionOverlay(): boolean {
+    return this.config.captionOutput === "burned" || this.config.captionOutput === "both";
+  }
+
+  private shouldWriteCaptionSidecar(): boolean {
+    return this.config.captionOutput === "sidecar" || this.config.captionOutput === "both";
+  }
+
+  private getSourceClipOutputPath(outputDir: string, clipId: string, sourcePath: string): string {
+    const extension = extname(sourcePath) || ".mp4";
+    return join(outputDir, `${clipId}_clip${extension}`);
+  }
+
+  private getCaptionSidecarPath(videoPath: string): string {
+    const extension = extname(videoPath);
+    const stem = extension ? basename(videoPath, extension) : basename(videoPath);
+    return join(dirname(videoPath), `${stem}.srt`);
+  }
+
+  private toArtifactPaths(
+    artifacts: Partial<ClipArtifacts>,
+    isComplete = false,
+  ): Record<string, string> {
+    const artifactPaths: Record<string, string> = {};
+
+    for (const [key, value] of Object.entries(artifacts)) {
+      if (key === "clipId" || typeof value !== "string" || value.length === 0) {
+        continue;
+      }
+      artifactPaths[key] = value;
+    }
+
+    if (isComplete) {
+      artifactPaths[CLIP_COMPLETION_MARKER] = "true";
+    }
+
+    return artifactPaths;
   }
 
   private extractVideoId(url: string): string {

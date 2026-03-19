@@ -1,22 +1,33 @@
 import { createLogger } from "../utils/logger";
-import { getVideoDuration, runFfmpeg } from "../utils/ffmpeg";
+import { getVideoDuration, runFfmpeg, secondsToSrtTimestamp } from "../utils/ffmpeg";
 import { ensureDir } from "../utils/fs";
 import { bundle } from "@remotion/bundler";
 import { renderMedia, selectComposition } from "@remotion/renderer";
-import { dirname, resolve, join } from "path";
+import { basename, dirname, extname, join, resolve } from "path";
 import type { Config } from "../config";
 import type { CaptionWord, CaptionGroup, CaptionOverlayProps } from "../remotion/types";
 
 const log = createLogger("captions");
 const FPS = 30;
 const WORDS_PER_GROUP = 6;
-const WHISPER_CLI = "whisper-cli";
 const MODELS_DIR = resolve(__dirname, "../../models");
 
 let bundlePromise: Promise<string> | null = null;
 
 interface WhisperWord {
   word: string;
+  start: number;
+  end: number;
+}
+
+interface TimedWord {
+  text: string;
+  start: number;
+  end: number;
+}
+
+interface CaptionCue {
+  text: string;
   start: number;
   end: number;
 }
@@ -45,16 +56,14 @@ export class CaptionGenerator {
     const speed = config.clipSpeed;
 
     const workDir = dirname(outputPath);
-    const whisperWords = await this.whisperWordTimestamps(desilencedClipPath, config, workDir);
-    log.info(`Whisper extracted ${whisperWords.length} words`);
-
-    const scaled = whisperWords.map((w) => ({
-      text: w.word,
-      start: w.start / speed,
-      end: w.end / speed,
-    }));
-
-    const framed: CaptionWord[] = scaled.map((w) => ({
+    const timedWords = await this.extractTimedWords(
+      desilencedClipPath,
+      config,
+      workDir,
+      outputPath,
+      config.clipSpeed,
+    );
+    const framed: CaptionWord[] = timedWords.map((w) => ({
       text: w.text,
       startFrame: Math.round(w.start * FPS),
       endFrame: Math.round(w.end * FPS),
@@ -106,21 +115,67 @@ export class CaptionGenerator {
     return outputPath;
   }
 
+  async generateSrt(videoPath: string, outputPath: string, config: Config): Promise<string> {
+    ensureDir(dirname(outputPath));
+
+    const workDir = dirname(outputPath);
+    const timedWords = await this.extractTimedWords(videoPath, config, workDir, outputPath);
+    const cues = this.groupTimedWords(timedWords);
+
+    const lines: string[] = [];
+    cues.forEach((cue, index) => {
+      lines.push(String(index + 1));
+      lines.push(`${secondsToSrtTimestamp(cue.start)} --> ${secondsToSrtTimestamp(cue.end)}`);
+      lines.push(cue.text);
+      lines.push("");
+    });
+
+    await Bun.write(outputPath, lines.join("\n"));
+    log.info(`Caption sidecar written: ${outputPath}`);
+    return outputPath;
+  }
+
+  private async extractTimedWords(
+    videoPath: string,
+    config: Config,
+    workDir: string,
+    outputPath: string,
+    timingDivisor = 1,
+  ): Promise<TimedWord[]> {
+    const whisperWords = await this.whisperWordTimestamps(
+      videoPath,
+      config,
+      workDir,
+      config.whisperCliPath,
+      outputPath,
+    );
+    log.info(`Whisper extracted ${whisperWords.length} words`);
+
+    return whisperWords.map((word) => ({
+      text: word.word,
+      start: word.start / timingDivisor,
+      end: word.end / timingDivisor,
+    }));
+  }
+
   private async whisperWordTimestamps(
     videoPath: string,
     config: Config,
     workDir: string,
+    whisperCli: string,
+    outputPath: string,
   ): Promise<WhisperWord[]> {
     const modelPath = join(MODELS_DIR, `ggml-${config.whisperModel}.bin`);
     log.info(`Running whisper-cli word-level transcription (model: ${config.whisperModel})...`);
 
-    const wavPath = join(workDir, "caption_audio.wav");
+    const tempBase = basename(outputPath, extname(outputPath));
+    const wavPath = join(workDir, `${tempBase}_audio.wav`);
     await runFfmpeg(["-i", videoPath, "-ar", "16000", "-ac", "1", "-f", "wav", "-y", wavPath]);
 
-    const jsonBase = join(workDir, "caption_words");
+    const jsonBase = join(workDir, `${tempBase}_words`);
     const proc = Bun.spawn(
       [
-        WHISPER_CLI,
+        whisperCli,
         "-m",
         modelPath,
         "-f",
@@ -164,6 +219,21 @@ export class CaptionGenerator {
     }
 
     return words;
+  }
+
+  private groupTimedWords(words: TimedWord[]): CaptionCue[] {
+    const cues: CaptionCue[] = [];
+
+    for (let i = 0; i < words.length; i += WORDS_PER_GROUP) {
+      const chunk = words.slice(i, i + WORDS_PER_GROUP);
+      cues.push({
+        text: chunk.map((word) => word.text).join(" "),
+        start: chunk[0].start,
+        end: chunk[chunk.length - 1].end,
+      });
+    }
+
+    return cues;
   }
 
   private groupWords(words: CaptionWord[]): CaptionGroup[] {

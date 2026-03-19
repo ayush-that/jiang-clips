@@ -75,10 +75,11 @@ export interface ClipCandidate {
 export interface ClipArtifacts {
   clipId: string;
   extractedVideoPath: string;
-  silenceRemovedPath: string;
-  srtPath: string;
-  captionOverlayPath: string;
-  finalReelPath: string;
+  exportedVideoPath: string;
+  silenceRemovedPath?: string;
+  captionSrtPath?: string;
+  captionOverlayPath?: string;
+  finalReelPath?: string;
 }
 
 export interface SilenceRange {
@@ -107,3 +108,5 @@ export const CLIP_STAGES = [
   PipelineStage.GENERATE_CAPTIONS,
   PipelineStage.COMPOSE_REEL,
 ] as const;
+
+export const CLIP_COMPLETION_MARKER = "__clip_complete__";

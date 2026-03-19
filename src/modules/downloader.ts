@@ -2,18 +2,32 @@ import { createLogger } from "../utils/logger";
 import { ensureDir } from "../utils/fs";
 import { join } from "path";
 import type { VideoMetadata } from "../pipeline/types";
+import type { Config } from "../config";
 
 const log = createLogger("downloader");
 
 export class Downloader {
+  constructor(private config?: Config) {}
+
+  private ytDlpBaseArgs(): string[] {
+    const args = ["yt-dlp"];
+    if (this.config?.cookiesFromBrowser) {
+      args.push("--cookies-from-browser", this.config.cookiesFromBrowser);
+    }
+    return args;
+  }
+
   async download(videoUrl: string, outputDir: string): Promise<VideoMetadata> {
     ensureDir(outputDir);
     log.info(`Fetching metadata for ${videoUrl}`);
 
-    const metaProc = Bun.spawn(["yt-dlp", "--cookies-from-browser", "chrome", "--dump-json", "--no-download", videoUrl], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
+    const metaProc = Bun.spawn(
+      [...this.ytDlpBaseArgs(), "--dump-json", "--no-download", videoUrl],
+      {
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
     const metaJson = await new Response(metaProc.stdout).text();
     const metaErr = await new Response(metaProc.stderr).text();
     const metaExit = await metaProc.exited;
@@ -25,7 +39,7 @@ export class Downloader {
     const duration = (meta.duration as number) || 0;
     const uploadDate = (meta.upload_date as string) || "";
 
-    const outputPath = join(outputDir, `${videoId}.mp4`);
+    const outputPath = join(outputDir, `${videoId}.webm`);
 
     if (await Bun.file(outputPath).exists()) {
       log.info(`Video already downloaded: ${outputPath}`);
@@ -35,13 +49,11 @@ export class Downloader {
     log.info(`Downloading: ${title} (${Math.round(duration / 60)} min)`);
     const dlProc = Bun.spawn(
       [
-        "yt-dlp",
-        "--cookies-from-browser",
-        "chrome",
+        ...this.ytDlpBaseArgs(),
         "-f",
         "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "--remux-video",
-        "mp4",
+        "--merge-output-format",
+        "webm",
         "-o",
         outputPath,
         "--no-playlist",

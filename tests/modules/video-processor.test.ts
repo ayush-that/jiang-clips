@@ -44,6 +44,37 @@ async function createTestVideo() {
   await proc.exited;
 }
 
+function createConfig(overrides?: {
+  silenceThresholdDb?: number;
+  silenceMinDuration?: number;
+  subwaySurfers?: string;
+}) {
+  return {
+    geminiApiKey: "test-key",
+    whisperModel: "base" as const,
+    whisperCliPath: "whisper-cli",
+    maxParallelClips: 3,
+    silenceThresholdDb: overrides?.silenceThresholdDb ?? -35,
+    silenceMinDuration: overrides?.silenceMinDuration ?? 0.8,
+    outputWidth: 1080,
+    outputHeight: 1920,
+    clipSpeed: 1.2,
+    maxClips: 0,
+    preferYouTubeTranscripts: true,
+    captionAnimate: true,
+    clipRenderMode: "reel" as const,
+    captionOutput: "burned" as const,
+    cookiesFromBrowser: "",
+    paths: {
+      data: TMP,
+      output: TMP,
+      assets: TMP,
+      subwaySurfers: overrides?.subwaySurfers ?? join(TMP, "no-surfers"),
+      checkpointDb: join(TMP, "test.db"),
+    },
+  };
+}
+
 afterAll(() => {
   if (existsSync(TMP)) rmSync(TMP, { recursive: true, force: true });
 });
@@ -75,31 +106,17 @@ describe("VideoProcessor", () => {
   test("removeSilence produces shorter output when silence exists", async () => {
     await createTestVideo();
     const vp = new VideoProcessor();
-    const config = {
-      geminiApiKey: "",
-      whisperModel: "base" as const,
-      maxParallelClips: 3,
+    const config = createConfig({
       silenceThresholdDb: -30,
       silenceMinDuration: 0.5,
-      outputWidth: 1080,
-      outputHeight: 1920,
-      preferYouTubeTranscripts: true,
-      captionAnimate: true,
-      paths: {
-        data: "./data",
-        output: "./output",
-        assets: "./assets",
-        subwaySurfers: "./assets/subway-surfers",
-        checkpointDb: "./data/test.db",
-      },
-    };
+    });
 
     const outputPath = join(TMP, "desilenced.mp4");
     const result = await vp.removeSilence(TEST_VIDEO, outputPath, config);
-    expect(existsSync(result)).toBe(true);
+    expect(existsSync(result.path)).toBe(true);
 
     const originalInfo = await runFfprobe(TEST_VIDEO);
-    const cleanInfo = await runFfprobe(result);
+    const cleanInfo = await runFfprobe(result.path);
     // With silence removed, output should be shorter
     expect(cleanInfo.duration).toBeLessThanOrEqual(originalInfo.duration);
   }, 30_000);
@@ -107,31 +124,37 @@ describe("VideoProcessor", () => {
   test("composeSingleReel (no subway surfers) produces 9:16 output", async () => {
     await createTestVideo();
     const vp = new VideoProcessor();
-    const config = {
-      geminiApiKey: "",
-      whisperModel: "base" as const,
-      maxParallelClips: 3,
-      silenceThresholdDb: -35,
-      silenceMinDuration: 0.8,
-      outputWidth: 1080,
-      outputHeight: 1920,
-      preferYouTubeTranscripts: true,
-      captionAnimate: true,
-      paths: {
-        data: TMP,
-        output: TMP,
-        assets: TMP,
-        subwaySurfers: join(TMP, "no-surfers"),
-        checkpointDb: join(TMP, "test.db"),
-      },
-    };
+    const config = createConfig();
 
     const outputPath = join(TMP, "reel.mp4");
-    const result = await vp.composeReel(TEST_VIDEO, null, config, outputPath);
+    const result = await vp.composeReel(TEST_VIDEO, config, outputPath);
     expect(existsSync(result)).toBe(true);
 
     const info = await runFfprobe(result);
     expect(info.width).toBe(1080);
     expect(info.height).toBe(1920);
   }, 60_000);
+
+  test("exportClip copies an extracted clip into the output directory", async () => {
+    await createTestVideo();
+    const vp = new VideoProcessor();
+    const clip = {
+      id: "test-clip-export",
+      title: "Test Export Clip",
+      hookLine: "hook",
+      startTime: 1,
+      endTime: 4,
+      duration: 3,
+      reasoning: "test",
+      viralScore: 7,
+      tags: ["test"],
+    };
+
+    const extractedPath = await vp.extractClip(TEST_VIDEO, clip, join(TMP, "clips"));
+    const exportedPath = join(TMP, "exports", "test-clip-export.mp4");
+    const result = await vp.exportClip(extractedPath, exportedPath);
+
+    expect(result).toBe(exportedPath);
+    expect(existsSync(result)).toBe(true);
+  });
 });
